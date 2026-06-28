@@ -113,7 +113,10 @@ def main():
             bpy.context.view_layer.objects.active = bpy.data.objects[0]
 
         print(f"=== EXPORT {dst} ===")
-        bpy.ops.export_mesh.dts(filepath=dst, original_dts_path=src)
+        # Do NOT pass original_dts_path: that activates donor skeleton-sync
+        # (vertex reprojection). A normal round-trip relies on the importer's
+        # collection prop (dts_source_file) for header splicing only.
+        bpy.ops.export_mesh.dts(filepath=dst)
 
         orig = summarize(src, Dts)
         rt = summarize(dst, Dts)
