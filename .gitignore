@@ -134,3 +134,8 @@ zombie_blender_script.py
 
 # --- Reference docs are tracked under docs/ (see docs/) ---
 # (All .md is tracked; reference material lives in docs/.)
+
+# --- Repo tools are tracked (override scratch script patterns above) ---
+!tools/
+!tools/*.py
+!tools/*.md
