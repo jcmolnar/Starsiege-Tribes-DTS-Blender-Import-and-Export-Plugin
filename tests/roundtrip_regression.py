@@ -68,8 +68,21 @@ def summarize(path, Dts):
             bounds = None
         meshes.append({'nv': getattr(m, 'num_vertices', 0),
                        'nf': getattr(m, 'num_faces', 0),
+                       'ntv': getattr(m, 'num_texture_vertices', 0),
                        'bounds': bounds})
-    return {'size': os.path.getsize(path), 'counts': counts, 'meshes': meshes}
+    # Material map filenames (texture preservation)
+    mats = []
+    try:
+        if getattr(d, 'materials', None):
+            for p in d.materials.params:
+                mf = getattr(p, 'map_file', b'')
+                if isinstance(mf, bytes):
+                    mf = mf.split(b'\x00')[0].decode('ascii', 'ignore')
+                mats.append(mf)
+    except Exception as e:
+        mats = ['ERR %r' % e]
+    return {'size': os.path.getsize(path), 'counts': counts,
+            'meshes': meshes, 'materials': mats}
 
 def compare(orig, rt):
     """Return list of human-readable discrepancies (empty == PASS)."""
@@ -86,6 +99,14 @@ def compare(orig, rt):
                 issues.append(f"mesh{i} verts: {om['nv']} -> {rm['nv']}")
             if om['nf'] != rm['nf']:
                 issues.append(f"mesh{i} faces: {om['nf']} -> {rm['nf']}")
+            # Texture vertices: the exporter de-duplicates identical UVs, so the
+            # round-trip count may be <= original. But UVs must not be LOST (if the
+            # original had any, the round-trip must too) nor INFLATED beyond original.
+            otv, rtv = om['ntv'], rm['ntv']
+            if otv > 0 and rtv == 0:
+                issues.append(f"mesh{i} texverts lost: {otv} -> 0")
+            if rtv > otv:
+                issues.append(f"mesh{i} texverts inflated: {otv} -> {rtv}")
             if om['bounds'] and rm['bounds']:
                 # allow small float drift; flag meaningful spatial divergence
                 drift = max(abs(a - b) for a, b in zip(om['bounds'], rm['bounds']))
@@ -93,6 +114,10 @@ def compare(orig, rt):
                     issues.append(
                         f"mesh{i} bounds drift {drift:.3f}: "
                         f"{om['bounds']} -> {rm['bounds']}")
+    # Materials / texture filenames must be preserved exactly.
+    if orig.get('materials') != rt.get('materials'):
+        issues.append(
+            f"materials: {orig.get('materials')} -> {rt.get('materials')}")
     return issues
 
 def main():
@@ -122,10 +147,12 @@ def main():
         rt = summarize(dst, Dts)
         print(f"\nORIGINAL : {orig['size']} bytes  {orig['counts']}")
         for i, m in enumerate(orig['meshes']):
-            print(f"  mesh{i}: nv={m['nv']} nf={m['nf']} bounds={m['bounds']}")
+            print(f"  mesh{i}: nv={m['nv']} nf={m['nf']} ntv={m['ntv']} bounds={m['bounds']}")
+        print(f"  materials: {orig['materials']}")
         print(f"ROUNDTRIP: {rt['size']} bytes  {rt['counts']}")
         for i, m in enumerate(rt['meshes']):
-            print(f"  mesh{i}: nv={m['nv']} nf={m['nf']} bounds={m['bounds']}")
+            print(f"  mesh{i}: nv={m['nv']} nf={m['nf']} ntv={m['ntv']} bounds={m['bounds']}")
+        print(f"  materials: {rt['materials']}")
 
         issues = compare(orig, rt)
         print("\n" + "=" * 50)
