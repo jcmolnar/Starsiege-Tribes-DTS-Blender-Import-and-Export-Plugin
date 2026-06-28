@@ -126,11 +126,5 @@ transform_*.py
 verify_*.py
 zombie_blender_script.py
 
-# --- Markdown notes that are scratch (keep README.md tracked) ---
-MIXAMO_BONE_MAPPING.md
-MIXAMO_WORKFLOW.md
-README GUIDE.md
-blender_addon_anomalies.md
-darkstar_dts_master_reference.md
-dts_character_creation_guide.md
-handoff_report.md
+# --- Reference docs are tracked under docs/ (see docs/) ---
+# (All .md is tracked; reference material lives in docs/.)
