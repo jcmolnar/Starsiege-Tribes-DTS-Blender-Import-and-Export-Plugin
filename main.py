@@ -469,8 +469,13 @@ class ImportDTS(bpy.types.Operator, ImportHelper):
                             shader_node = mat_nodes.new("ShaderNodeTexImage")
                             shader_node.location = -400, 200
                             shader_node.select = True
-                            # Create the path to the image based on the model path
-                            image_path = os.path.dirname(self.filepath) + os.path.sep + bitmap_name.decode('ascii')
+                            # Create the path to the image based on the model path.
+                            # abspath: Blender's image loader resolves relative
+                            # paths against its own CWD, not the process CWD, so
+                            # a relative filepath passes os.path.exists below but
+                            # then fails to load.
+                            image_path = os.path.abspath(
+                                os.path.dirname(self.filepath) + os.path.sep + bitmap_name.decode('ascii'))
 
                             # Check if .png exists
                             if os.path.exists(image_path):
