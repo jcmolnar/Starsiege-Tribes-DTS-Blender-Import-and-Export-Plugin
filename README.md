@@ -34,6 +34,10 @@ Developed against Blender 3.0+ (current work is on 5.0).
 - Static, animated, collision, debris, and hulk meshes
 - Levels of Detail (LODs)
 - Node/sequence animations (imported as empties + timeline markers)
+- **Vertex-morph (frame track) animation** — morph frames import as shape keys
+  (decoded with each frame's own scale/origin) with their playback keyframed on
+  the timeline; survives edit + re-export (Sensor Jammer, bows, monsters,
+  vehicle flames)
 - Textures (auto-applied when image files sit next to the `.dts`)
 - IFL sequences (animated materials)
 - Armors with bones, and vehicles
@@ -99,20 +103,21 @@ Useful docs:
   for axes, mace/hammer for bludgeons, spear/trident for polearms, dagger/knife).
   Custom animation is added by baking a shape-key morph and injecting it as a
   frame-track. This pipeline shipped **46 weapons/shields/orbs** into the Kingdom of
-  Kronos RPG. A fully general *fresh* (donor-less) weapon exporter is still open.
+  Kronos RPG.
+- **Fresh (donor-less) weapon export works in-game**: a weapon exported with a
+  fully generated header (no donor splice) equips and animates correctly
+  (verified with a round-tripped Axe). The donor transplant remains the quickest
+  path for adapting modern models, but it is no longer the only one.
 - **Textures:** weapon/shield skins are 8-bit MS-BMP indexed to a world multipalette
   (`bfReserved2` = paletteIndex); the orb accessory shape needs native **PBMP**.
-- Sub-animations (e.g. vehicle flames) and some vertex animations (Sensor
-  Jammer) are not fully supported.
 - Animated UVs are not supported.
 - Import one model per scene — importing several at once can break the hierarchy
   and overlap timeline markers.
 
 ## Wishlist
-- Robust fresh weapon export (no donor transplant needed)
 - Bone-based animation (auto-create bones, actions instead of markers)
 - Animated UVs
-- Support for `DIS`, `TED`, and `DIL` files
+- Support for `TED` and `DIL` files (a `DIS` exporter exists as a separate project)
 
 ## Credits
 Fork of the original *TribesToBlender* import addon, extended with export and the

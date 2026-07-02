@@ -337,21 +337,80 @@ NORMAL_TABLE = [
 ]
 
 
+# Memoization cache for find_closest_normal. Meshes reuse the same loop
+# normals heavily (flat-shaded faces, mirrored geometry), so caching on the
+# rounded components turns ~256 distance tests per face corner into a dict hit.
+_normal_cache = {}
+
+
 def find_closest_normal(normal):
     """Find the index of the closest pre-computed normal using Euclidean distance.
-    
+
     This matches the Darkstar engine's PackedVertex::encodeNormal() which uses
     m_dist() (Euclidean distance) to find the best fit, NOT dot product.
+    (Squared distance is compared here; argmin is identical without the sqrt.)
     """
+    key = (round(normal[0], 4), round(normal[1], 4), round(normal[2], 4))
+    cached = _normal_cache.get(key)
+    if cached is not None:
+        return cached
     best_idx = 0
     best_dist = 999999.0
     for i, n in enumerate(NORMAL_TABLE):
-        # Euclidean distance (matches engine behavior)
-        dist = math.sqrt((normal[0] - n[0])**2 + (normal[1] - n[1])**2 + (normal[2] - n[2])**2)
+        dist = (normal[0] - n[0])**2 + (normal[1] - n[1])**2 + (normal[2] - n[2])**2
         if dist < best_dist:
             best_dist = dist
             best_idx = i
+    _normal_cache[key] = best_idx
     return best_idx
+
+
+def material_map_file(mat):
+    """Texture filename for the DTS material list.
+
+    Prefer the actual image plugged into the material's node tree (what the
+    engine must load), falling back to the material name. Blender-side .png
+    conversions are mapped back to the engine's .bmp naming, mirroring the
+    importer's .bmp -> .png substitution.
+    """
+    try:
+        if mat.use_nodes:
+            for node in mat.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and node.image:
+                    name = os.path.basename(node.image.filepath) or node.image.name
+                    base, ext = os.path.splitext(name)
+                    if ext.lower() == '.png':
+                        name = base + '.bmp'
+                    if name:
+                        return name
+    except Exception:
+        pass
+    return mat.name
+
+
+def iter_anim_fcurves(anim_data):
+    """Yield fcurves from AnimData across legacy AND slotted (Blender 4.4+)
+    actions. Blender 5.0 removed Action.fcurves for layered actions; the
+    curves live in a channelbag keyed by the animated ID's action slot.
+    """
+    act = anim_data.action if anim_data else None
+    if act is None:
+        return
+    legacy = getattr(act, 'fcurves', None)
+    if legacy is not None:
+        yield from legacy
+        return
+    slot = getattr(anim_data, 'action_slot', None)
+    for layer in getattr(act, 'layers', ()):
+        for strip in getattr(layer, 'strips', ()):
+            cb = None
+            if slot is not None and hasattr(strip, 'channelbag'):
+                try:
+                    cb = strip.channelbag(slot)
+                except Exception:
+                    cb = None
+            if cb is not None:
+                yield from cb.fcurves
 
 
 def get_object_ancestry(obj):
@@ -646,6 +705,11 @@ def process_node_hierarchy(objects, writer, flatten_hierarchy=False):
         root_idx = root_indices[0]
         # Swap Node 0 and the root node
         nodes[0], nodes[root_idx] = nodes[root_idx], nodes[0]
+        # Keep objects[i] <-> nodes[i] in sync: everything downstream (vertex
+        # node-space transforms, LOD detail detection, default transforms)
+        # indexes the objects list by node index. objects is swapped in place
+        # so the caller's list reflects the change too.
+        objects[0], objects[root_idx] = objects[root_idx], objects[0]
         # Update all parent/child/sibling references
         for n in nodes:
             if n['parent'] == 0: n['parent'] = root_idx
@@ -718,7 +782,8 @@ class DTSWriter:
     def write_quat16(self, stream, x, y, z, w):
         """Write quaternion as 4 signed 16-bit integers."""
         def float_to_s16(f):
-            return max(-32767, min(32767, int(f * 32767)))
+            # round() instead of int() truncation: halves the quantization error
+            return max(-32767, min(32767, int(round(f * 32767))))
         self.write_s16(stream, float_to_s16(x))
         self.write_s16(stream, float_to_s16(y))
         self.write_s16(stream, float_to_s16(z))
@@ -951,9 +1016,9 @@ class DTSWriter:
         for uv in mesh_data['texture_vertices']:
             self.write_point2f(stream, uv[0], uv[1])
             
-        # faces - Axe.dts uses (TextureIndex, VertexIndex) order for ALL pairs
+        # faces: 3 pairs of (VertexIndex, TextureIndex) + material = 28 bytes total
+        # (matches vertex_index_pair in dts.ksy: vertex_index first, then texture_index)
         for face in mesh_data['faces']:
-            # Each face has 3 pairs: (T0, V0), (T1, V1), (T2, V2) + material = 28 bytes total
             for i in range(3):
                 self.write_u32(stream, face['vertex_indices'][i])
                 self.write_u32(stream, face['texture_indices'][i])
@@ -981,8 +1046,10 @@ class DTSWriter:
             self.write_u8(stream, mat['rgb'][2])
             self.write_u8(stream, mat.get('rgb_flags', 0))
             
-            # Map file (32 chars for v2+)
-            map_file = mat.get('map_file', '')[:32].ljust(32, '\x00')
+            # Map file (32-byte field for v2+). Truncate to 31 chars so the
+            # field always contains a null terminator; a full 32-char name
+            # would make the engine read past the field.
+            map_file = mat.get('map_file', '')[:31].ljust(32, '\x00')
             stream.write(map_file.encode('ascii'))
             
                 # v3+ fields
@@ -1493,7 +1560,8 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
         
         for obj in objects:
             obj_eval = None # Initialize to avoid UnboundLocalError
-            
+            _muted_fcurves = []  # shape-key value fcurves muted during export
+
             is_bounds_empty = (obj.name.lower() == 'bounds' and obj.type == 'EMPTY')
             
             # Skip non-mesh objects (unless it's the special bounds empty)
@@ -1523,6 +1591,19 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                 if obj.type == 'MESH' and obj.data.shape_keys:
                     for _skb in obj.data.shape_keys.key_blocks:
                         _skb.value = 0.0
+                    # If the key VALUES are fcurve-driven (the importer animates
+                    # them along the timeline for playback), the animation system
+                    # would overwrite the zeroing on the next evaluation. Mute
+                    # the curves during export; restored in the loop's cleanup.
+                    _sk_anim = obj.data.shape_keys.animation_data
+                    if _sk_anim and _sk_anim.action:
+                        try:
+                            for _fc in iter_anim_fcurves(_sk_anim):
+                                if not _fc.mute:
+                                    _fc.mute = True
+                                    _muted_fcurves.append(_fc)
+                        except Exception as _e:
+                            print(f"WARNING: could not mute shape-key fcurves: {_e}")
                     # depsgraph must re-evaluate or evaluated_get() returns the stale
                     # (non-zero-valued) mesh and the bounds inflate.
                     depsgraph.update()
@@ -1658,9 +1739,9 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                         local_x, local_y, local_z = transformed_verts_dict[v_idx]
                         
                         # Normalize to 0-255 using local bounds
-                        x = int((local_x - min_pt[0]) / bounds_size[0] * 255)
-                        y = int((local_y - min_pt[1]) / bounds_size[1] * 255)
-                        z = int((local_z - min_pt[2]) / bounds_size[2] * 255)
+                        x = int(round((local_x - min_pt[0]) / bounds_size[0] * 255))
+                        y = int(round((local_y - min_pt[1]) / bounds_size[1] * 255))
+                        z = int(round((local_z - min_pt[2]) / bounds_size[2] * 255))
                         x = max(0, min(255, x)); y = max(0, min(255, y)); z = max(0, min(255, z))
                         
                         dts_vertices.append((x, y, z, n_idx))
@@ -1677,9 +1758,9 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                     local_x, local_y, local_z = transformed_verts_dict[v_idx]
                     
                     # Normalize to 0-255 using local bounds
-                    x = int((local_x - min_pt[0]) / bounds_size[0] * 255)
-                    y = int((local_y - min_pt[1]) / bounds_size[1] * 255)
-                    z = int((local_z - min_pt[2]) / bounds_size[2] * 255)
+                    x = int(round((local_x - min_pt[0]) / bounds_size[0] * 255))
+                    y = int(round((local_y - min_pt[1]) / bounds_size[1] * 255))
+                    z = int(round((local_z - min_pt[2]) / bounds_size[2] * 255))
                     x = max(0, min(255, x)); y = max(0, min(255, y)); z = max(0, min(255, z))
                     
                     # Add to dts_vertices
@@ -1690,9 +1771,9 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
             if not dts_vertices and len(mesh.vertices) > 0:
                 for v_idx in range(len(mesh.vertices)):
                     local_x, local_y, local_z = transformed_verts_dict[v_idx]
-                    x = int((local_x - min_pt[0]) / bounds_size[0] * 255)
-                    y = int((local_y - min_pt[1]) / bounds_size[1] * 255)
-                    z = int((local_z - min_pt[2]) / bounds_size[2] * 255)
+                    x = int(round((local_x - min_pt[0]) / bounds_size[0] * 255))
+                    y = int(round((local_y - min_pt[1]) / bounds_size[1] * 255))
+                    z = int(round((local_z - min_pt[2]) / bounds_size[2] * 255))
                     x = max(0, min(255, x)); y = max(0, min(255, y)); z = max(0, min(255, z))
                     dts_vertices.append((x, y, z, 0)) # Default normal 0
             
@@ -1789,16 +1870,32 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
             # Only applies to plain round-trips (import_scale 1.0, no axis/winding
             # conversion, no donor sync, no shape keys, unmodified vertex count
             # and unit world scale); new/edited models keep the general path.
+            # Multi-frame (vertex-morph) meshes can also round-trip faithfully
+            # when the importer stored the per-frame layout: each shape key
+            # is packed against ITS OWN original frame scale/origin and written
+            # back at its original first_vert offset (frames may overlap).
+            _sk = obj.data.shape_keys if obj.type == 'MESH' else None
+            _stored_fv = list(obj.get("dts_frame_first_verts", []))
+            if _sk is None:
+                _morph_faithful_ok = len(_stored_fv) <= 1
+            else:
+                _morph_faithful_ok = (
+                    len(_stored_fv) >= 2
+                    and len(_sk.key_blocks) == len(_stored_fv)
+                    and "dts_frame_scales" in obj
+                    and "dts_frame_origins" in obj
+                )
             faithful = (
                 "dts_frame_scale_x" in obj
                 and abs(obj.get("dts_import_scale", 1.0) - 1.0) < 1e-6
                 and not self.convert_axes
                 and not self.convert_winding
                 and not use_donor_sync
-                and obj.data.shape_keys is None
+                and _morph_faithful_ok
                 and obj.get("dts_vertex_count", -1) == len(mesh.vertices)
                 and all(abs(s - 1.0) <= 0.001 for s in obj.matrix_world.to_scale())
             )
+            faithful_morph = None
             if faithful:
                 frame_scale = (obj["dts_frame_scale_x"],
                                obj["dts_frame_scale_y"],
@@ -1824,40 +1921,56 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                 min_pt = frame_origin
                 bounds_size = tuple(max(0.0001, s * 255.0) for s in frame_scale)
 
+                # Faithful MULTI-FRAME reconstruction: rebuild the original
+                # vertex array (original total length, frames at their original
+                # first_vert offsets) with each frame packed against its own
+                # stored scale/origin. Basis (frame 0) reuses packed_verts.
+                # Morph frames reuse the basis vertex normals: shape keys carry
+                # no normals, and re-lighting morphs with rest normals matches
+                # what the general path does.
+                if _sk is not None and len(_stored_fv) >= 2:
+                    _fscales = list(obj["dts_frame_scales"])
+                    _forigins = list(obj["dts_frame_origins"])
+                    _nvpf = len(mesh.vertices)
+                    _total_nv = int(obj.get("dts_total_vertices", 0))
+                    if _total_nv < _nvpf:
+                        _total_nv = max(int(fv) + _nvpf for fv in _stored_fv)
+                    _all_verts = [(0, 0, 0, 0)] * _total_nv
+                    _frames_list = []
+                    _kbs = _sk.key_blocks
+                    for _f, _fv in enumerate(_stored_fv):
+                        _fv = int(_fv)
+                        _fs = tuple(_fscales[_f * 3:_f * 3 + 3])
+                        _fo = tuple(_forigins[_f * 3:_f * 3 + 3])
+                        if _f == 0:
+                            for _i in range(_nvpf):
+                                _all_verts[_fv + _i] = packed_verts[_i]
+                        else:
+                            for _i in range(_nvpf):
+                                _co = _kbs[_f].data[_i].co
+                                _c = []
+                                for _a in range(3):
+                                    _sc_ = _fs[_a]
+                                    _c.append(int(round((_co[_a] - _fo[_a]) / _sc_)) if _sc_ else 0)
+                                _all_verts[_fv + _i] = (
+                                    max(0, min(255, _c[0])),
+                                    max(0, min(255, _c[1])),
+                                    max(0, min(255, _c[2])),
+                                    packed_verts[_i][3])
+                        _frames_list.append({'first_vert': _fv, 'scale': _fs, 'origin': _fo})
+                    faithful_morph = {'verts': _all_verts, 'frames': _frames_list}
+
             # Check if object has negative scale (determinant < 0)
             # Negative determinant means additional flip is needed
             is_flipped = obj.matrix_world.determinant() < 0
             
-            # Build face data
-            # DTS uses CLOCKWISE (CW) winding, Blender uses CCW.
-            # For NEW models: swap indices 1↔2 to convert CCW→CW (if convert_winding is ON).
-            # For ROUND-TRIPS: leave as-is since importer already reads CW data.
-            faces = []
-            for poly in mesh.polygons:
-                if len(poly.loop_indices) != 3:
-                    continue
-                    
-                v = [loop_to_dts_vert[li] for li in poly.loop_indices]
-                t = [loop_to_uv_idx[li] for li in poly.loop_indices]
-                
-                # CCW→CW conversion: only apply if user enabled it for new models
-                # Also account for negative determinant (flipped scale) which inverts winding
-                should_swap = self.convert_winding and not is_flipped
-                if should_swap:
-                    v = [v[0], v[2], v[1]]
-                    t = [t[0], t[2], t[1]]
-                
-                face = {
-                    'vertex_indices': v,
-                    'texture_indices': t,
-                    'material': poly.material_index
-                }
-                faces.append(face)
-            
-            # REFRESH: Axe.dts has faces in REVERSED order compared to Blender loops
-            faces.reverse()
-            
-            # Collect materials
+            # Collect materials FIRST and build the slot -> global-list remap.
+            # Faces must reference the shape-wide material list, but
+            # poly.material_index is the OBJECT's slot number. On round-trips
+            # the importer gives every object the full material list in the
+            # same order (slot == global), but a fresh multi-object model with
+            # differing slots needs the remap or faces point at wrong materials.
+            slot_to_global = []
             for i, mat_slot in enumerate(obj.material_slots):
                 if mat_slot.material and mat_slot.material.name not in materials_set:
                     mat = mat_slot.material
@@ -1895,12 +2008,55 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                         # shapes, which the engine mis-handled -> crash on equip.
                         'index': 0,
                         'rgb': (255, 255, 255),
-                        'map_file': mat.name[:32],
+                        'map_file': material_map_file(mat)[:31],
                         'type': 0,
                         'elasticity': 1.0,
                         'friction': 1.0,
                     }
-                    
+
+                # Map this slot to its global material-list index (insertion
+                # order of materials_set). Empty slots keep the raw slot index
+                # (previous behavior; there is nothing sensible to point at).
+                if mat_slot.material:
+                    slot_to_global.append(list(materials_set.keys()).index(mat_slot.material.name))
+                else:
+                    slot_to_global.append(i)
+
+            # Build face data
+            # DTS uses CLOCKWISE (CW) winding, Blender uses CCW.
+            # For NEW models: swap indices 1↔2 to convert CCW→CW (if convert_winding is ON).
+            # For ROUND-TRIPS: leave as-is since importer already reads CW data.
+            faces = []
+            for poly in mesh.polygons:
+                if len(poly.loop_indices) != 3:
+                    continue
+
+                v = [loop_to_dts_vert[li] for li in poly.loop_indices]
+                t = [loop_to_uv_idx[li] for li in poly.loop_indices]
+
+                # CCW→CW conversion: only apply if user enabled it for new models
+                # Also account for negative determinant (flipped scale) which inverts winding
+                should_swap = self.convert_winding and not is_flipped
+                if should_swap:
+                    v = [v[0], v[2], v[1]]
+                    t = [t[0], t[2], t[1]]
+
+                # Translate the object slot index to the shape-wide material index
+                if poly.material_index < len(slot_to_global):
+                    mat_global = slot_to_global[poly.material_index]
+                else:
+                    mat_global = poly.material_index
+
+                face = {
+                    'vertex_indices': v,
+                    'texture_indices': t,
+                    'material': mat_global
+                }
+                faces.append(face)
+
+            # REFRESH: Axe.dts has faces in REVERSED order compared to Blender loops
+            faces.reverse()
+
             # Compute radius: Use stored DTS value if available AND geometry not modified
             if "dts_mesh_radius" in obj and not geometry_modified:
                 radius = obj["dts_mesh_radius"]
@@ -1934,9 +2090,11 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
             }]
             
             # Check shape key status on ORIGINAL mesh data
+            # (skipped when the faithful multi-frame path already rebuilt the
+            # original frame layout above)
             has_shape_keys = original_mesh_data and original_mesh_data.shape_keys
-            
-            if has_shape_keys and original_mesh_data.shape_keys.key_blocks:
+
+            if faithful_morph is None and has_shape_keys and original_mesh_data.shape_keys.key_blocks:
                 key_blocks = original_mesh_data.shape_keys.key_blocks
                 # Skip the first one (Basis) since we already have it
                 for key_idx, key_block in enumerate(key_blocks[1:], start=1):
@@ -1946,15 +2104,23 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                     frame_verts = list(packed_verts)
                     
                     for (v_idx, n_idx), dts_idx in vert_lookup.items():
-                        # Get position from shape key data
-                        sk_co = key_block.data[v_idx].co
-                        # Shape keys are ALSO local to the object
-                        local_x, local_y, local_z = sk_co
-                        
+                        # Shape-key coords are object-local; run them through the
+                        # SAME transform chain as the basis vertices (world ->
+                        # node space -> global scale -> axis conversion). The
+                        # bounds-union pass above already does this; packing raw
+                        # local coords here mangled morph frames whenever the
+                        # object had a non-identity transform or convert_axes on.
+                        sk_world = obj.matrix_world @ key_block.data[v_idx].co
+                        sk_node = node_matrix_inv @ sk_world
+                        sk = [sk_node[i] * self.global_scale for i in range(3)]
+                        if self.convert_axes:
+                            sk = [sk[0], sk[2], -sk[1]]
+                        local_x, local_y, local_z = sk
+
                         # Pack to 0-255 using the SAME local bounds as the basis frame
-                        x = int((local_x - min_pt[0]) / bounds_size[0] * 255)
-                        y = int((local_y - min_pt[1]) / bounds_size[1] * 255)
-                        z = int((local_z - min_pt[2]) / bounds_size[2] * 255)
+                        x = int(round((local_x - min_pt[0]) / bounds_size[0] * 255))
+                        y = int(round((local_y - min_pt[1]) / bounds_size[1] * 255))
+                        z = int(round((local_z - min_pt[2]) / bounds_size[2] * 255))
                         x = max(0, min(255, x)); y = max(0, min(255, y)); z = max(0, min(255, z))
                         
                         frame_verts[dts_idx] = (x, y, z, n_idx)
@@ -1970,8 +2136,16 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
             all_verts_flat = []
             for frame_verts in all_frames_verts:
                 all_verts_flat.extend(frame_verts)
-            
+
             num_frames = len(all_frames_verts)
+
+            # Faithful multi-frame path: use the reconstructed original layout
+            # (frames at original first_vert offsets, per-frame scale/origin).
+            if faithful_morph is not None:
+                all_verts_flat = faithful_morph['verts']
+                frames_data = faithful_morph['frames']
+                num_frames = len(frames_data)
+                shape_keys = [kb.name for kb in obj.data.shape_keys.key_blocks[1:]]
             
             mesh_data = {
                 'name': obj.name,
@@ -2000,6 +2174,9 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
             elif mesh:
                 # If we created a temp mesh (either from dummy or copy) and it wasn't cleared above
                 bpy.data.meshes.remove(mesh)
+            # Restore any shape-key value fcurves muted for basis evaluation
+            for _fc in _muted_fcurves:
+                _fc.mute = False
         
         # Add object names
         print("DEBUG: ENTERING NAME LOOP", flush=True)
@@ -2159,20 +2336,12 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                 'first_subsequence': 0,
             })
         
-        # Collect animation keyframes from all objects
+        # (A former pre-pass here frame-sampled every object's whole action into
+        # an animation_data list that was never read -- removed: it only cost a
+        # full depsgraph evaluation per frame per object.)
         scene = context.scene
         original_frame = scene.frame_current
-        
-        animation_data = []  # List of (obj_index, keyframes)
-        for i, obj in enumerate(objects):
-            keyframes = collect_object_keyframes(obj, scene, context, self.flatten_hierarchy, None, self.global_scale)
-            if keyframes:
-                animation_data.append((i, keyframes))
-        
-        # Restore original frame
-        # Restore original frame
-        scene.frame_set(original_frame)
-        
+
         # Determine animation sequences from timeline markers
         markers = sorted(scene.timeline_markers, key=lambda m: m.frame)
         sequence_ranges = []
@@ -2236,8 +2405,13 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                  mesh_data = mesh_list[obj_idx]
             
             node = shape_data['nodes'][obj_idx] if shape_data['nodes'] else None
-            
+
             # --- POPULATE DEFAULT TRANSFORM FOR THIS NODE ---
+            # Re-set the bind-pose frame EVERY iteration: collect_object_keyframes
+            # below leaves the scene at the last frame of the last sequence, so
+            # without this, every object after the first would have its default
+            # transform sampled from an animated pose instead of the bind pose.
+            scene.frame_set(scene.frame_start)
             # Use evaluated object to get current world scale (handles inherited scaling)
             obj_eval = obj.evaluated_get(depsgraph)
             
@@ -2336,6 +2510,9 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                         num_node_subs += 1
                 node['num_subsequences'] = num_node_subs
 
+        # Keyframe sampling moved the timeline around; put it back where the user had it
+        scene.frame_set(original_frame)
+
         shape_data['num_sequences'] = len(shape_data['sequences'])
         shape_data['num_subsequences'] = len(shape_data['subsequences'])
         shape_data['num_keyframes'] = len(shape_data['keyframes'])
@@ -2405,6 +2582,12 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
         original_dts_path = self.original_dts_path
         if not original_dts_path:
             for obj in objects:
+                # Object-level prop first: the importer's LOD organizer moves
+                # objects into LOD_* collections, away from the collection that
+                # carries dts_source_file.
+                if obj.get("dts_source_file"):
+                    original_dts_path = obj["dts_source_file"]
+                    break
                 for coll in obj.users_collection:
                     if "dts_source_file" in coll:
                         original_dts_path = coll["dts_source_file"]
@@ -2451,24 +2634,44 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
                         orig_names_list = [n.split(b'\x00')[0].decode('ascii', errors='ignore') for n in orig_shape.names]
                         orig_objs_list = getattr(orig_shape, 'objects', []) or getattr(orig_shape, 'objects_v7', [])
                         
-                        orig_name_to_mesh_idx = {}
+                        # DUPLICATE NAMES ARE REAL in stock files (FlameThrower
+                        # has several objects all named 'flame'; Blender renames
+                        # them flame.001 etc. on import). A plain name->chunk
+                        # dict collapses them, splicing ONE flame's geometry
+                        # into every slot. Map by (name, occurrence) instead:
+                        # occurrence = Nth appearance in object-table order,
+                        # which matches Blender's .001/.002 suffix ordering.
+                        def _base_name(n):
+                            return re.sub(r'\.\d+$', '', n)
+
+                        # mesh_index -> (name, occurrence) from the original
+                        orig_idx_info = {}
+                        _occ = {}
                         for o in orig_objs_list:
-                            orig_name_to_mesh_idx[orig_names_list[o.name]] = o.mesh_index
-                            
-                        # 2. Parse exported to get name -> exported_chunk map
+                            nm = orig_names_list[o.name]
+                            k = _occ.get(nm, 0)
+                            _occ[nm] = k + 1
+                            orig_idx_info.setdefault(o.mesh_index, (nm, k))
+
+                        # 2. Parse exported to get (base name, occurrence) -> chunk
                         exp_dts_obj = Dts(KaitaiStream(BytesIO(exported_bytes)))
                         exp_shape = exp_dts_obj.shape.data.obj_data
                         exp_names_list = [n.split(b'\x00')[0].decode('ascii', errors='ignore') for n in exp_shape.names]
                         exp_objs_list = getattr(exp_shape, 'objects', []) or getattr(exp_shape, 'objects_v7', [])
-                        
-                        exp_name_to_chunk = {}
+
+                        _exp_named = []
                         for o in exp_objs_list:
                             name = exp_names_list[o.name]
                             if o.mesh_index < len(exp_meshes):
                                 blk = exp_meshes[o.mesh_index]
                                 chunk = exported_bytes[blk['pos'] : blk['pos'] + blk['size']]
-                                exp_name_to_chunk[name] = chunk
-                        
+                                _exp_named.append((name, chunk))
+                        # 'flame' < 'flame.001' < 'flame.002': suffix sort puts
+                        # occurrences in import order
+                        _exp_named.sort(key=lambda t: t[0])
+                        exp_name_to_chunk = {}
+                        for name, chunk in _exp_named:
+                            exp_name_to_chunk.setdefault(_base_name(name), []).append(chunk)
 
                     except Exception as e:
                         print(f"WARNING: Name-based mapping failed, falling back to index-based: {e}")
@@ -2480,26 +2683,26 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
 
 
 
-                    # 7. Add exported meshes (RE-ORDERED BY ORIGINAL NAME)
+                    # 7. Add exported meshes (RE-ORDERED BY ORIGINAL NAME + OCCURRENCE)
                     if exp_name_to_chunk:
                         # Append meshes in the order the ORIGINAL header expects (by mesh_index)
                         # We must satisfy every mesh slot the original header points to.
                         for i in range(len(orig_meshes)):
-                            # Find the name associated with original mesh index i
-                            name = next((n for n, idx in orig_name_to_mesh_idx.items() if idx == i), None)
+                            name, occurrence = orig_idx_info.get(i, (None, 0))
                             # The 'bounds' mesh is synthesized by the exporter: the importer
                             # turns the bounds object into an empty, discarding its original
                             # 2-vertex culling box, so the exported chunk is wrong (inflated /
                             # whole-model extents). The bounds box is never edited in Blender,
                             # so reuse the ORIGINAL bounds mesh bytes for a faithful round-trip.
+                            chunks = exp_name_to_chunk.get(name) if name else None
                             if name and name.lower() == 'bounds':
                                 blk = orig_meshes[i]
                                 hybrid += original_bytes[blk['pos'] : blk['pos'] + blk['size']]
-                            elif name and name in exp_name_to_chunk:
-                                hybrid += exp_name_to_chunk[name]
+                            elif chunks and occurrence < len(chunks):
+                                hybrid += chunks[occurrence]
                             else:
                                 # Fallback: if name not found, use index-based or original
-                                print(f"WARNING: Mesh index {i} ('{name}') not found in export! Using original data.")
+                                print(f"WARNING: Mesh index {i} ('{name}' #{occurrence}) not found in export! Using original data.")
                                 blk = orig_meshes[i]
                                 hybrid += original_bytes[blk['pos'] : blk['pos'] + blk['size']]
                     else:
