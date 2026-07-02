@@ -217,12 +217,20 @@ def summarize(path, Dts):
 
         # UV extents (texvert COUNT may shrink via dedup; the extents of the
         # used UV space must survive -- catches flips/scaling/garbage UVs).
+        # Only FACE-REFERENCED texverts count: some files carry hundreds of
+        # thousands of orphan texverts (e.g. dragon_flyer: 322k total, 3.6k
+        # referenced) which dedup legitimately drops.
         tvs = getattr(m, 'texture_vertices', []) or []
-        if tvs:
-            uv_bbox = (round(min(t.x for t in tvs), 3),
-                       round(max(t.x for t in tvs), 3),
-                       round(min(t.y for t in tvs), 3),
-                       round(max(t.y for t in tvs), 3))
+        used_tv = set()
+        for f in getattr(m, 'faces', []) or []:
+            for v in f.vip:
+                if 0 <= v.texture_index < len(tvs):
+                    used_tv.add(v.texture_index)
+        if used_tv:
+            uv_bbox = (round(min(tvs[i].x for i in used_tv), 3),
+                       round(max(tvs[i].x for i in used_tv), 3),
+                       round(min(tvs[i].y for i in used_tv), 3),
+                       round(max(tvs[i].y for i in used_tv), 3))
         else:
             uv_bbox = None
 
