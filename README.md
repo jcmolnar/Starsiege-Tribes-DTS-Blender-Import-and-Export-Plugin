@@ -103,7 +103,11 @@ Useful docs:
   for axes, mace/hammer for bludgeons, spear/trident for polearms, dagger/knife).
   Custom animation is added by baking a shape-key morph and injecting it as a
   frame-track. This pipeline shipped **46 weapons/shields/orbs** into the Kingdom of
-  Kronos RPG. A fully general *fresh* (donor-less) weapon exporter is still open.
+  Kronos RPG.
+- **Fresh (donor-less) weapon export works in-game**: a weapon exported with a
+  fully generated header (no donor splice) equips and animates correctly
+  (verified with a round-tripped Axe). The donor transplant remains the quickest
+  path for adapting modern models, but it is no longer the only one.
 - **Textures:** weapon/shield skins are 8-bit MS-BMP indexed to a world multipalette
   (`bfReserved2` = paletteIndex); the orb accessory shape needs native **PBMP**.
 - Animated UVs are not supported.
@@ -111,10 +115,9 @@ Useful docs:
   and overlap timeline markers.
 
 ## Wishlist
-- Robust fresh weapon export (no donor transplant needed)
 - Bone-based animation (auto-create bones, actions instead of markers)
 - Animated UVs
-- Support for `DIS`, `TED`, and `DIL` files
+- Support for `TED` and `DIL` files (a `DIS` exporter exists as a separate project)
 
 ## Credits
 Fork of the original *TribesToBlender* import addon, extended with export and the
